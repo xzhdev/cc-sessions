@@ -4645,6 +4645,16 @@ fn clone_session_for_provider_locked_with_hint(
     }
     if let Some(b) = active_branch.as_ref() {
         if b.provider == provider {
+            // 分页会话的 rollout 只是 history_base 链上的存根，完整历史在同目录的
+            // 延续文件（文件名带 _<子会话ID> 后缀）里；threads 表由 Codex App 自己
+            // 维护并指向延续文件。此处按存根 upsert 会把 rollout_path 改回存根、
+            // 回退 updated_at，导致 Codex App 中该会话只剩中断的存根内容。
+            if src_brief.history_mode == "paginated" {
+                report.skipped_reason =
+                    Some("分页会话（paginated）已属于当前 provider，跳过本地索引可见性修复以保留 Codex App 指向延续文件的记录".into());
+                report.ok = true;
+                return Ok(report);
+            }
             if dry_run {
                 report.skipped_reason = Some("dry_run: 将复核并修复本地索引可见性".into());
             } else {
@@ -8012,6 +8022,61 @@ mod tests {
         assert_eq!(thread_after.source, thread_before.source);
         assert_eq!(thread_after.archived, thread_before.archived);
 
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_visibility_repair_preserves_paginated_thread_rollout_path() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-visibility-test");
+        let session_id = "paginated-visibility";
+        // paginated 会话的 rollout 是 history_base 链上的存根；threads 表由 Codex App
+        // 维护并指向带完整历史的延续文件。构造 threads 表指向延续文件、磁盘扫描
+        // 只能看到存根的 state_drift 场景。
+        let source = prepare_paginated_provider_switch_fixture(&codex, session_id)?;
+        let continuation_rel = format!("sessions/2026/04/24/rollout-{session_id}_continuation.jsonl");
+        let continuation_path = codex.join(&continuation_rel);
+        write_sync_rollout(&continuation_path, session_id, DEFAULT_PROVIDER, &[])?;
+        {
+            let state = state_db::open(&codex)?;
+            state.execute(
+                "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                rusqlite::params![continuation_rel, session_id],
+            )?;
+        }
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let source_before = fs::read(&source)?;
+        let continuation_before = fs::read(&continuation_path)?;
+        let mut forker = FakeProviderThreadForker::new(codex.clone());
+
+        for dry_run in [true, false] {
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                session_id.to_string(),
+                Some("custom".to_string()),
+                SwitchStrategy::Continuous,
+                dry_run,
+                Some(&source),
+                &mut forker,
+            )?;
+
+            assert!(report.ok);
+            assert!(report.skipped_reason.is_some_and(|reason| reason.contains("paginated")));
+            assert_eq!(forker.fork_count, 0);
+            assert_eq!(forker.delete_count, 0);
+            let thread_after = read_thread_state_map(&codex)?
+                .remove(session_id)
+                .expect("paginated fixture thread state");
+            assert_eq!(
+                thread_after.rollout_path.as_deref(),
+                Some(continuation_rel.as_str()),
+                "visibility repair must not rewrite paginated rollout_path back to the stub"
+            );
+        }
+
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::read(&continuation_path)?, continuation_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
         fs::remove_dir_all(codex).ok();
         Ok(())
     }
