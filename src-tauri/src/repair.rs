@@ -707,12 +707,8 @@ fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, Rollo
     Ok(rollouts)
 }
 
-/// 判断 rollout 文件名是否为分页(paginated)会话的延续文件。
-///
-/// Codex 分页会话在触发分页/续写时会生成形如
-/// `rollout-<ts>-<session_id>_<continuation_id>.jsonl` 的延续文件，它与存根
-/// 文件 `rollout-<ts>-<session_id>.jsonl` 携带**同一个 session id**。
-/// 两者同时存在时，索引类重建必须指向延续文件，否则会话只剩存根内容。
+/// Codex 的替换/续写 rollout 在稳定的 thread UUID 后附加独立的 rollout UUID。
+/// 只识别官方文件名格式，避免把手动备份的 `_backup` 等后缀当成当前历史。
 fn rollout_filename_is_paginated_continuation(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -720,38 +716,61 @@ fn rollout_filename_is_paginated_continuation(path: &Path) -> bool {
     let Some(stem) = name.strip_suffix(".jsonl") else {
         return false;
     };
-    // 存根: rollout-<ts>-<session_id>.jsonl；延续: rollout-<ts>-<session_id>_<continuation_id>.jsonl
-    // 时间戳与 uuid 均不含下划线，stem 中出现 '_' 即为延续文件。
-    stem.strip_prefix("rollout-")
-        .is_some_and(|rest| rest.contains('_'))
+    let Some(rest) = stem.strip_prefix("rollout-") else {
+        return false;
+    };
+    let Some(timestamp) = rest.get(..19) else {
+        return false;
+    };
+    if rest.get(19..20) != Some("-")
+        || chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%dT%H-%M-%S").is_err()
+    {
+        return false;
+    }
+    let Some((thread_id, rollout_id)) = rest.get(20..).and_then(|ids| ids.split_once('_')) else {
+        return false;
+    };
+    let is_uuid = |id: &str| {
+        id.len() == 36
+            && id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    };
+    is_uuid(thread_id) && is_uuid(rollout_id) && thread_id != rollout_id
 }
 
-/// 同 id 的存根/延续文件二选一：延续文件优先；同为延续或同为存根时 updated_at 新者胜。
-///
-/// chosen 的 value 为 (payload, updated_at_ms, is_continuation)，payload 携带
-/// 额外的分类标记（如是否来自有效 session_meta），延续文件优先时一并带过去。
+/// 同 id 优先保留续写文件，其次比较更新时间，再按文件名中的时间/UUID 稳定排序。
 fn prefer_continuation_entry<K, V>(
-    chosen: &mut std::collections::BTreeMap<K, ((V, bool), i64, bool)>,
+    chosen: &mut BTreeMap<K, (V, i64, PathBuf)>,
     id: K,
-    payload: (V, bool),
+    payload: V,
     updated_at_ms: i64,
     path: &Path,
 ) where
     K: Ord,
 {
-    let is_continuation = rollout_filename_is_paginated_continuation(path);
     let replace = match chosen.get(&id) {
-        Some((_, existing_updated, existing_is_continuation)) => {
-            match (is_continuation, *existing_is_continuation) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => updated_at_ms >= *existing_updated,
-            }
+        Some((_, existing_updated, existing_path)) => {
+            (
+                rollout_filename_is_paginated_continuation(path),
+                updated_at_ms,
+                path.file_name(),
+                path,
+            ) > (
+                rollout_filename_is_paginated_continuation(existing_path),
+                *existing_updated,
+                existing_path.file_name(),
+                existing_path.as_path(),
+            )
         }
         None => true,
     };
     if replace {
-        chosen.insert(id, (payload, updated_at_ms, is_continuation));
+        chosen.insert(id, (payload, updated_at_ms, path.to_path_buf()));
     }
 }
 
@@ -1227,9 +1246,7 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
     let codex = PathBuf::from(&codex_dir);
     let rollouts = family::scan_rollouts(&codex)?;
     // 分页会话的存根与延续文件共用同一 id；索引必须指向延续文件且不得重复。
-    // chosen 的 value 为 ((entry, has_meta), updated_at_ms, is_continuation)。
-    let mut chosen: std::collections::BTreeMap<String, ((Value, bool), i64, bool)> =
-        std::collections::BTreeMap::new();
+    let mut chosen = BTreeMap::new();
     let mut written = 0u32;
     let mut salvaged = 0u32;
     let mut errors: Vec<String> = Vec::new();
@@ -1291,7 +1308,6 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
         }
         entries.push(entry);
     }
-    entries.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
 
     if !dry_run {
         let out_path = paths::session_index_path(&codex);
@@ -2578,7 +2594,6 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     let active_rollouts = family::scan_rollouts(&codex)?;
     let archived_rollouts = family::scan_archived_rollouts(&codex)?;
     let mut scanned = 0u32;
-    let mut upserted = 0u32;
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
 
@@ -2591,10 +2606,8 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
 
     let state = state_db::open(&codex)?;
     let effective_cols = effective_threads_cols(&state)?;
-    let mut planned_upserts = Vec::new();
     // 分页会话的存根与延续文件共用同一 id；threads 行必须指向延续文件。
-    let mut planned_by_id: std::collections::BTreeMap<String, ((Vec<Value>, bool), i64, bool)> =
-        std::collections::BTreeMap::new();
+    let mut planned_by_id = BTreeMap::new();
 
     for (p, archived) in active_rollouts
         .iter()
@@ -2603,20 +2616,12 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     {
         scanned += 1;
         match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
-            Ok(Some(values)) => {
-                let id = values
-                    .first()
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let updated_at_ms = read_rollout_brief(&codex, p)?
-                    .map(|b| if b.updated_at_ms > 0 { b.updated_at_ms } else { b.created_at_ms })
-                    .unwrap_or(0);
+            Ok(Some(row)) => {
                 prefer_continuation_entry(
                     &mut planned_by_id,
-                    id,
-                    (values, true),
-                    updated_at_ms,
+                    row.id,
+                    row.values,
+                    row.updated_at_ms,
                     p,
                 );
             }
@@ -2628,20 +2633,14 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
         }
     }
 
+    let upserted = planned_by_id.len() as u32;
     if !dry_run {
-        planned_upserts = planned_by_id
-            .into_values()
-            .map(|((values, _), _, _)| values)
-            .collect();
-        upserted = planned_upserts.len() as u32;
         let transaction =
             rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
-        for values in &planned_upserts {
+        for (values, _, _) in planned_by_id.values() {
             upsert_thread_values(&transaction, &effective_cols, values)?;
         }
         transaction.commit()?;
-    } else {
-        upserted = planned_by_id.len() as u32;
     }
 
     Ok(ThreadsRebuildReport {
@@ -2694,12 +2693,18 @@ fn threads_upsert_sql(cols: &[&str]) -> String {
     format!("INSERT INTO threads ({cols_sql}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {update_sql}")
 }
 
+struct ThreadRolloutValues {
+    id: String,
+    updated_at_ms: i64,
+    values: Vec<Value>,
+}
+
 fn thread_values_from_rollout(
     codex: &Path,
     rollout: &Path,
     archived: bool,
     cols: &[&str],
-) -> AppResult<Option<Vec<Value>>> {
+) -> AppResult<Option<ThreadRolloutValues>> {
     let brief = match read_rollout_brief(codex, rollout)? {
         Some(b) => b,
         None => return Ok(None),
@@ -2732,8 +2737,11 @@ fn thread_values_from_rollout(
         0
     };
 
-    Ok(Some(
-        cols.iter()
+    Ok(Some(ThreadRolloutValues {
+        id: brief.id.clone(),
+        updated_at_ms: brief.updated_at_ms.max(brief.created_at_ms),
+        values: cols
+            .iter()
             .map(|name| match *name {
                 "id" => Value::String(brief.id.clone()),
                 "rollout_path" => Value::String(brief.path.to_string_lossy().into_owned()),
@@ -2827,7 +2835,7 @@ fn thread_values_from_rollout(
                 _ => payload.get(*name).cloned().unwrap_or(Value::Null),
             })
             .collect(),
-    ))
+    }))
 }
 
 fn bind_thread_values(values: &[Value]) -> Vec<Box<dyn rusqlite::ToSql>> {
@@ -2875,7 +2883,7 @@ pub(crate) fn upsert_thread_from_rollout(
         Some(values) => values,
         None => return Ok(false),
     };
-    upsert_thread_values(state, &cols, &values)?;
+    upsert_thread_values(state, &cols, &values.values)?;
     Ok(true)
 }
 
@@ -5574,10 +5582,62 @@ fn list_mismatched_sessions_from_rollouts(
     let mut out: Vec<ProviderSyncTarget> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
     let index_ids = read_session_index_ids(codex)?;
+    // 同一逻辑会话只检查一次。优先采用 threads 中仍存在且身份匹配的路径；
+    // 无记录时按续写文件及文件名选择，诊断无需为此读取完整对话。
+    let mut selected_rollouts: BTreeMap<String, (PathBuf, RolloutIdentity)> = BTreeMap::new();
+    for (path, identity) in active_rollouts {
+        let replace = match selected_rollouts.get(&identity.id) {
+            Some((existing_path, _)) => {
+                let recorded_path = thread_states
+                    .get(&identity.id)
+                    .and_then(|state| state.rollout_path.as_deref())
+                    .and_then(|recorded| {
+                        paths::host_path_from_codex_record(codex, recorded)
+                            .canonicalize()
+                            .ok()
+                    });
+                let matches_recorded = |path: &Path| {
+                    recorded_path.as_ref().is_some_and(|recorded| {
+                        path.canonicalize()
+                            .is_ok_and(|candidate| candidate == *recorded)
+                    })
+                };
+                (
+                    matches_recorded(&path),
+                    rollout_filename_is_paginated_continuation(&path),
+                    path.file_name(),
+                    &path,
+                ) > (
+                    matches_recorded(existing_path),
+                    rollout_filename_is_paginated_continuation(existing_path),
+                    existing_path.file_name(),
+                    existing_path,
+                )
+            }
+            None => true,
+        };
+        if replace {
+            selected_rollouts.insert(identity.id.clone(), (path, identity));
+        }
+    }
+    let active_rollouts: Vec<_> = selected_rollouts.into_values().collect();
     let active_rollout_paths = active_rollouts
         .iter()
         .map(|(path, identity)| (identity.id.as_str(), path))
         .collect::<BTreeMap<_, _>>();
+    let branch_is_usable = |branch: &FamilyBranch, expected_provider: &str| -> AppResult<bool> {
+        let Some(path) = active_rollout_paths.get(branch.id.as_str()) else {
+            return Ok(false);
+        };
+        rollout_is_usable_provider_session(
+            codex,
+            &thread_states,
+            &index_ids,
+            &branch.id,
+            expected_provider,
+            path,
+        )
+    };
 
     let store = family::load(codex)?;
     family_managed_ids.extend(store.index.keys().cloned());
@@ -5605,14 +5665,7 @@ fn list_mismatched_sessions_from_rollouts(
             }
             let mut has_target_branch = false;
             for branch in &f.chain {
-                if branch.provider == target_provider
-                    && family_branch_is_usable_provider(
-                        codex,
-                        &thread_states,
-                        &index_ids,
-                        branch,
-                        target_provider,
-                    )?
+                if branch.provider == target_provider && branch_is_usable(branch, target_provider)?
                 {
                     has_target_branch = true;
                     break;
@@ -5621,13 +5674,7 @@ fn list_mismatched_sessions_from_rollouts(
             if active.provider != target_provider && has_target_branch {
                 continue;
             }
-            let state_drift = !family_branch_is_usable_provider(
-                codex,
-                &thread_states,
-                &index_ids,
-                active,
-                &active.provider,
-            )?;
+            let state_drift = !branch_is_usable(active, &active.provider)?;
             if (active.provider != target_provider || state_drift) && seen.insert(active.id.clone())
             {
                 out.push(ProviderSyncTarget {
@@ -7778,8 +7825,13 @@ mod tests {
     }
 
     #[test]
-    fn paginated_continuous_sync_reports_supported_strategy_before_writes() -> AppResult<()> {
-        for dry_run in [true, false] {
+    fn paginated_in_place_sync_reports_supported_strategy_before_writes() -> AppResult<()> {
+        for (dry_run, strategy) in [
+            (true, SwitchStrategy::Continuous),
+            (false, SwitchStrategy::Continuous),
+            (true, SwitchStrategy::Follow),
+            (false, SwitchStrategy::Follow),
+        ] {
             let codex = temp_codex_dir("cc-session-manager-paginated-continuous-preflight");
             let source_id = "paginated-continuous-source";
             let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
@@ -7795,7 +7847,7 @@ mod tests {
                 codex.to_string_lossy().into_owned(),
                 source_id.to_string(),
                 Some(DEFAULT_PROVIDER.to_string()),
-                SwitchStrategy::Continuous,
+                strategy,
                 dry_run,
                 Some(&source),
                 &mut forker,
@@ -8128,7 +8180,8 @@ mod tests {
         // 维护并指向带完整历史的延续文件。构造 threads 表指向延续文件、磁盘扫描
         // 只能看到存根的 state_drift 场景。
         let source = prepare_paginated_provider_switch_fixture(&codex, session_id)?;
-        let continuation_rel = format!("sessions/2026/04/24/rollout-{session_id}_continuation.jsonl");
+        let continuation_rel =
+            format!("sessions/2026/04/24/rollout-{session_id}_continuation.jsonl");
         let continuation_path = codex.join(&continuation_rel);
         write_sync_rollout(&continuation_path, session_id, DEFAULT_PROVIDER, &[])?;
         {
@@ -8155,7 +8208,9 @@ mod tests {
             )?;
 
             assert!(report.ok);
-            assert!(report.skipped_reason.is_some_and(|reason| reason.contains("paginated")));
+            assert!(report
+                .skipped_reason
+                .is_some_and(|reason| reason.contains("paginated")));
             assert_eq!(forker.fork_count, 0);
             assert_eq!(forker.delete_count, 0);
             let thread_after = read_thread_state_map(&codex)?
@@ -8895,7 +8950,7 @@ mod tests {
             .iter()
             .position(|name| *name == "tokens_used")
             .expect("tokens_used column");
-        assert_eq!(values[token_index], Value::from(2_468_000i64));
+        assert_eq!(values.values[token_index], Value::from(2_468_000i64));
         Ok(())
     }
 
@@ -8961,12 +9016,54 @@ mod tests {
     }
 
     #[test]
+    fn continuation_detection_rejects_noncanonical_rollout_names() {
+        let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let next = "019ff1a2-b3c4-7d5e-8f60-667788990011";
+        for (name, expected) in [
+            (
+                format!("rollout-2026-09-09T10-42-10-{id}_{next}.jsonl"),
+                true,
+            ),
+            (format!("rollout-2026-09-09T10-42-10-{id}.jsonl"), false),
+            (
+                format!("rollout-2026-09-09T10-42-10-{id}_backup.jsonl"),
+                false,
+            ),
+            (format!("rollout-invalid-{id}_{next}.jsonl"), false),
+        ] {
+            assert_eq!(
+                rollout_filename_is_paginated_continuation(Path::new(&name)),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_selection_is_stable_when_timestamps_match() {
+        let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let older = PathBuf::from(format!(
+            "rollout-2026-09-09T10-42-10-{id}_019ff1a2-b3c4-7d5e-8f60-667788990011.jsonl"
+        ));
+        let newer = PathBuf::from(format!(
+            "rollout-2026-09-09T10-42-10-{id}_019ff1a2-b3c4-7d5e-8f60-667788990012.jsonl"
+        ));
+        for paths in [[&older, &newer], [&newer, &older]] {
+            let mut chosen = BTreeMap::new();
+            for path in paths {
+                prefer_continuation_entry(&mut chosen, id, (path.clone(), true), 1_000, path);
+            }
+            assert_eq!(chosen[id].0 .0, newer);
+        }
+    }
+
+    #[test]
     fn repair_index_prefers_paginated_continuation_over_stub() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-index-paginated-dedup-test");
         let rollout_dir = codex.join("sessions").join("2026").join("09").join("09");
         fs::create_dir_all(&rollout_dir)?;
-        let id = "paginated-dedup-source";
-        let continuation_id = "paginated-dedup-cont";
+        let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let continuation_id = "019ff1a2-b3c4-7d5e-8f60-667788990011";
         let stub = rollout_dir.join(format!("rollout-2026-09-09T10-42-10-{id}.jsonl"));
         let cont = rollout_dir.join(format!(
             "rollout-2026-09-09T10-43-17-{id}_{continuation_id}.jsonl"
@@ -9007,8 +9104,8 @@ mod tests {
         let codex = temp_codex_dir("cc-session-manager-threads-paginated-dedup-test");
         let rollout_dir = codex.join("sessions").join("2026").join("09").join("09");
         fs::create_dir_all(&rollout_dir)?;
-        let id = "threads-paginated-dedup";
-        let continuation_id = "threads-paginated-cont";
+        let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let continuation_id = "019ff1a2-b3c4-7d5e-8f60-667788990011";
         let stub = rollout_dir.join(format!("rollout-2026-09-09T10-42-10-{id}.jsonl"));
         let cont = rollout_dir.join(format!(
             "rollout-2026-09-09T10-43-17-{id}_{continuation_id}.jsonl"
@@ -9666,6 +9763,72 @@ mod tests {
         fs::remove_dir_all(&codex).ok();
 
         assert_eq!(plan, vec!["unregistered-provider-session".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sync_plan_preserves_current_paginated_rollout_in_any_scan_order() -> AppResult<()> {
+        for registered in [false, true] {
+            let codex = temp_codex_dir("cc-session-manager-paginated-sync-selection-test");
+            let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+            let stub = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let current = stub.parent().unwrap().join(format!(
+                "rollout-2026-09-09T10-42-10-{id}_019ff1a2-b3c4-7d5e-8f60-667788990011.jsonl"
+            ));
+            let newest = stub.parent().unwrap().join(format!(
+                "rollout-2026-09-09T10-43-10-{id}_019ff1a2-b3c4-7d5e-8f60-667788990012.jsonl"
+            ));
+            fs::copy(&stub, &current)?;
+            fs::copy(&stub, &newest)?;
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &current)?;
+            if registered {
+                let mut store = family::load(&codex)?;
+                family::ensure_family_for(
+                    &mut store,
+                    id,
+                    "custom",
+                    &stub.strip_prefix(&codex).unwrap().to_string_lossy(),
+                    "source",
+                );
+                family::save(&codex, &store)?;
+            }
+
+            for has_recorded_path in [true, false] {
+                if !has_recorded_path {
+                    state.execute("DELETE FROM threads WHERE id = ?", [id])?;
+                }
+                for paths in [[&stub, &current, &newest], [&newest, &current, &stub]] {
+                    let rollouts = paths
+                        .into_iter()
+                        .map(|path| {
+                            Ok((
+                                path.clone(),
+                                read_rollout_identity(path)?.expect("rollout identity"),
+                            ))
+                        })
+                        .collect::<AppResult<Vec<_>>>()?;
+                    if has_recorded_path {
+                        assert!(list_mismatched_sessions_from_rollouts(&codex, "custom", rollouts.clone())?.is_empty(), "an existing current rollout must not be reported as state drift (registered={registered})");
+                    }
+                    let targets =
+                        list_mismatched_sessions_from_rollouts(&codex, DEFAULT_PROVIDER, rollouts)?;
+                    assert_eq!(
+                        targets,
+                        vec![ProviderSyncTarget {
+                            session_id: id.to_string(),
+                            rollout_path: if has_recorded_path {
+                                current.clone()
+                            } else {
+                                newest.clone()
+                            },
+                        }]
+                    );
+                }
+            }
+            drop(state);
+            fs::remove_dir_all(codex).ok();
+        }
         Ok(())
     }
 
