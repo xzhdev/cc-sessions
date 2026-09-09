@@ -707,6 +707,54 @@ fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, Rollo
     Ok(rollouts)
 }
 
+/// 判断 rollout 文件名是否为分页(paginated)会话的延续文件。
+///
+/// Codex 分页会话在触发分页/续写时会生成形如
+/// `rollout-<ts>-<session_id>_<continuation_id>.jsonl` 的延续文件，它与存根
+/// 文件 `rollout-<ts>-<session_id>.jsonl` 携带**同一个 session id**。
+/// 两者同时存在时，索引类重建必须指向延续文件，否则会话只剩存根内容。
+fn rollout_filename_is_paginated_continuation(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    // 存根: rollout-<ts>-<session_id>.jsonl；延续: rollout-<ts>-<session_id>_<continuation_id>.jsonl
+    // 时间戳与 uuid 均不含下划线，stem 中出现 '_' 即为延续文件。
+    stem.strip_prefix("rollout-")
+        .is_some_and(|rest| rest.contains('_'))
+}
+
+/// 同 id 的存根/延续文件二选一：延续文件优先；同为延续或同为存根时 updated_at 新者胜。
+///
+/// chosen 的 value 为 (payload, updated_at_ms, is_continuation)，payload 携带
+/// 额外的分类标记（如是否来自有效 session_meta），延续文件优先时一并带过去。
+fn prefer_continuation_entry<K, V>(
+    chosen: &mut std::collections::BTreeMap<K, ((V, bool), i64, bool)>,
+    id: K,
+    payload: (V, bool),
+    updated_at_ms: i64,
+    path: &Path,
+) where
+    K: Ord,
+{
+    let is_continuation = rollout_filename_is_paginated_continuation(path);
+    let replace = match chosen.get(&id) {
+        Some((_, existing_updated, existing_is_continuation)) => {
+            match (is_continuation, *existing_is_continuation) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => updated_at_ms >= *existing_updated,
+            }
+        }
+        None => true,
+    };
+    if replace {
+        chosen.insert(id, (payload, updated_at_ms, is_continuation));
+    }
+}
+
 pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
     read_rollout_brief_impl(codex_dir, path, None)
 }
@@ -1178,11 +1226,14 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
     let rollouts = family::scan_rollouts(&codex)?;
+    // 分页会话的存根与延续文件共用同一 id；索引必须指向延续文件且不得重复。
+    // chosen 的 value 为 ((entry, has_meta), updated_at_ms, is_continuation)。
+    let mut chosen: std::collections::BTreeMap<String, ((Value, bool), i64, bool)> =
+        std::collections::BTreeMap::new();
     let mut written = 0u32;
     let mut salvaged = 0u32;
     let mut errors: Vec<String> = Vec::new();
 
-    let mut entries: Vec<Value> = Vec::with_capacity(rollouts.len());
     for p in &rollouts {
         match read_rollout_brief(&codex, p) {
             Ok(Some(b)) => {
@@ -1194,13 +1245,19 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
                     0
                 };
                 let abs = b.path.to_string_lossy().into_owned();
-                entries.push(serde_json::json!({
+                let entry = serde_json::json!({
                     "id": b.id,
                     "thread_name": b.first_user_message.clone(),
                     "rollout_path": abs,
                     "updated_at": updated,
-                }));
-                written += 1;
+                });
+                prefer_continuation_entry(
+                    &mut chosen,
+                    b.id.clone(),
+                    (entry, true),
+                    updated,
+                    &b.path,
+                );
             }
             Ok(None) => {
                 // 没有 session_meta → 尝试从文件名救援
@@ -1211,13 +1268,13 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
-                    entries.push(serde_json::json!({
+                    let entry = serde_json::json!({
                         "id": id,
                         "thread_name": "",
                         "rollout_path": p.to_string_lossy(),
                         "updated_at": mtime_ms,
-                    }));
-                    salvaged += 1;
+                    });
+                    prefer_continuation_entry(&mut chosen, id, (entry, false), mtime_ms, p);
                 }
             }
             Err(e) => {
@@ -1225,6 +1282,16 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
             }
         }
     }
+    let mut entries: Vec<Value> = Vec::with_capacity(chosen.len());
+    for (_, ((entry, has_meta), _, _)) in chosen {
+        if has_meta {
+            written += 1;
+        } else {
+            salvaged += 1;
+        }
+        entries.push(entry);
+    }
+    entries.sort_by(|a, b| a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or("")));
 
     if !dry_run {
         let out_path = paths::session_index_path(&codex);
@@ -2525,6 +2592,9 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     let state = state_db::open(&codex)?;
     let effective_cols = effective_threads_cols(&state)?;
     let mut planned_upserts = Vec::new();
+    // 分页会话的存根与延续文件共用同一 id；threads 行必须指向延续文件。
+    let mut planned_by_id: std::collections::BTreeMap<String, ((Vec<Value>, bool), i64, bool)> =
+        std::collections::BTreeMap::new();
 
     for (p, archived) in active_rollouts
         .iter()
@@ -2534,10 +2604,21 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
         scanned += 1;
         match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
             Ok(Some(values)) => {
-                upserted += 1;
-                if !dry_run {
-                    planned_upserts.push(values);
-                }
+                let id = values
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let updated_at_ms = read_rollout_brief(&codex, p)?
+                    .map(|b| if b.updated_at_ms > 0 { b.updated_at_ms } else { b.created_at_ms })
+                    .unwrap_or(0);
+                prefer_continuation_entry(
+                    &mut planned_by_id,
+                    id,
+                    (values, true),
+                    updated_at_ms,
+                    p,
+                );
             }
             Ok(None) => skipped += 1,
             Err(e) => {
@@ -2548,12 +2629,19 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     }
 
     if !dry_run {
+        planned_upserts = planned_by_id
+            .into_values()
+            .map(|((values, _), _, _)| values)
+            .collect();
+        upserted = planned_upserts.len() as u32;
         let transaction =
             rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
         for values in &planned_upserts {
             upsert_thread_values(&transaction, &effective_cols, values)?;
         }
         transaction.commit()?;
+    } else {
+        upserted = planned_by_id.len() as u32;
     }
 
     Ok(ThreadsRebuildReport {
@@ -4816,6 +4904,12 @@ fn clone_session_for_provider_locked_with_hint(
     if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Continuous) {
         return Err(AppError::Other(
             "分页会话不支持连续模式；请选择散点模式（scatter），通过 Codex 官方派生保留完整历史，可在 Codex App 运行时执行"
+                .into(),
+        ));
+    }
+    if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Follow) {
+        return Err(AppError::Other(
+            "分页会话不支持跟随（follow）模式：就地改写只会命中存根或延续文件之一，且会按单文件回写 threads 索引；请选择散点模式（scatter），通过 Codex 官方派生保留完整历史"
                 .into(),
         ));
     }
@@ -8862,6 +8956,93 @@ mod tests {
         assert_eq!(report.written, 1);
         assert_ne!(fs::read(&index_path)?, b"sentinel-index-bytes\n");
         assert_eq!(fs::read(&global_path)?, global_before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn repair_index_prefers_paginated_continuation_over_stub() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-index-paginated-dedup-test");
+        let rollout_dir = codex.join("sessions").join("2026").join("09").join("09");
+        fs::create_dir_all(&rollout_dir)?;
+        let id = "paginated-dedup-source";
+        let continuation_id = "paginated-dedup-cont";
+        let stub = rollout_dir.join(format!("rollout-2026-09-09T10-42-10-{id}.jsonl"));
+        let cont = rollout_dir.join(format!(
+            "rollout-2026-09-09T10-43-17-{id}_{continuation_id}.jsonl"
+        ));
+        let meta_line = |ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "model_provider": DEFAULT_PROVIDER,
+                    "history_mode": "paginated",
+                    "cwd": r"F:\project\example"
+                }
+            })
+        };
+        let stub_body = serde_json::to_string(&meta_line("2026-09-09T02:42:10Z"))?;
+        let cont_body = serde_json::to_string(&meta_line("2026-09-09T02:43:17Z"))?;
+        fs::write(&stub, format!("{stub_body}\n"))?;
+        fs::write(&cont, format!("{cont_body}\n"))?;
+
+        let report = repair_session_index(codex.to_string_lossy().into_owned(), false)?;
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.written + report.salvaged, 1, "同 id 必须去重");
+        let index_path = paths::session_index_path(&codex);
+        let content = fs::read_to_string(&index_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "索引只能有一行: {content}");
+        let entry: Value = serde_json::from_str(lines[0])?;
+        assert_eq!(entry["rollout_path"].as_str(), Some(cont.to_str().unwrap()));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_threads_prefers_paginated_continuation_over_stub() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-threads-paginated-dedup-test");
+        let rollout_dir = codex.join("sessions").join("2026").join("09").join("09");
+        fs::create_dir_all(&rollout_dir)?;
+        let id = "threads-paginated-dedup";
+        let continuation_id = "threads-paginated-cont";
+        let stub = rollout_dir.join(format!("rollout-2026-09-09T10-42-10-{id}.jsonl"));
+        let cont = rollout_dir.join(format!(
+            "rollout-2026-09-09T10-43-17-{id}_{continuation_id}.jsonl"
+        ));
+        let meta_line = |ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "model_provider": DEFAULT_PROVIDER,
+                    "history_mode": "paginated",
+                    "cwd": r"F:\project\example"
+                }
+            })
+        };
+        let stub_body = serde_json::to_string(&meta_line("2026-09-09T02:42:10Z"))?;
+        let cont_body = serde_json::to_string(&meta_line("2026-09-09T02:43:17Z"))?;
+        fs::write(&stub, format!("{stub_body}\n"))?;
+        fs::write(&cont, format!("{cont_body}\n"))?;
+        let state = create_full_state(&codex)?;
+        drop(state);
+
+        let report = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)?;
+
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.upserted, 1, "同 id 只 upsert 一条");
+        let state = state_db::open_ro(&codex)?;
+        let rollout_path: String = state.query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rollout_path, cont.to_string_lossy());
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
